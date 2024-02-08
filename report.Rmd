@@ -1,0 +1,537 @@
+---
+title: "Predicting wine quality using classification models"
+author: '[didemch]'
+date: "`r Sys.Date()`"
+output: 
+  pdf_document: default
+urlcolor: blue
+bibliography: references.bib
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, error = TRUE, echo = FALSE, fig.pos='H', cache = TRUE)
+
+# Adapted from lecture slides 17
+kfold_cv <- function(data, estimator, predictor, kfolds = 5, responsename = "quality", lda=FALSE) {
+  n <- nrow(data)
+  fold.labels <- sample(rep(1:kfolds, length.out = n))
+  errors <- double(kfolds)
+  for (fold in 1:kfolds) {
+    test.rows <- fold.labels == fold
+    train <- data[!test.rows, ]
+    test <- data[test.rows, ]
+    current_model <- estimator(train)
+    predictions <- predictor(current_model, test[-12])
+    if (lda) {
+      predictions <- predictions$class
+    }
+    test_responses <- test[, responsename]
+    test_errors <- test_responses != predictions
+    errors[fold] <- mean(test_errors)
+  }
+  mean(errors)
+}
+
+library(leaps)
+library(corrplot)
+library(interactions)
+library(MASS)
+library(FNN)
+library(class)
+library(nnet)
+library(kableExtra)
+library(tree)
+library(maptree)
+library(randomForest)
+library(ggplot2)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(knitr)
+library(gt)
+set.seed(202110)
+```
+
+## Introduction
+After taking a Wine Studies course, I became interested in Winemaking. Winemaking is a complex craft as wine flavor and quality depend on many different factors such as acids, alcohol compounds, pH of the grape juice and others. I am interested in finding out whether it is possible to predict the quality of the wine because it would make it easier to find a good wine for laypeople.  
+
+Each wine has many different flavors; after drinking the same wine, some people may think it was fruity and some people may find it too sour. Hence, each person will judge the wine based on their own perception. But I thought it would be fun and interesting to find out whether we could "predict" the wine quality in advance based on its chemical features. Then, there might be a universal "grading" scheme for wines based on facts (values) rather than on people's wine tasting skills and preferences.  
+
+In this project I want to find out what would be the best classification model for the wine quality prediction. Along with that, I am interested in determining factors that influence the quality of the wine the most. I also want to find out whether there are any interactions between the factors themselves or whether there are any confounding factors? (Factors that are not considered but may influence wine quality significantly). After building classification models, I want to find prediction errors (such as CV or OOB) and determine any prediction risks involved.  
+
+## Dataset and Methods
+The dataset includes various parameters of Portuguese "Vinho Verde" white wine.[@wine-data] The data comes from the UCI Machine Learning repository as it has the most number of observations and predictors compared to other wine data sets that I came across. In the dataset there are 4898 observations with the following 11 qualitative attributes derived from physiochemical tests: `Fixed acidity`, `vol acidity`, `Citric acid`, `res sugar`, `Chlorides`, `Free sulfur dioxide`, `Total sulfur dioxide`, `Density`, `pH`, `Sulphates`, `Alcohol`. Finally, the 12th attribute is subjective `quality` out of 10. 
+
+Since I am trying to create a classifier that aims to predict the quality of white wine, where the quality is on an ordinal scale from 1 to 10 (1, 2, 3, 4, 5, 6, 7, 8, 9, and 10), it is not appropriate to use linear regression because model predictions can fall outside of the score range. Instead, I will attempt using different classification methods such as Classification Trees, Random forests, or KNN on this data and see what method would result in a more accurate prediction and what features are most indicative of a good quality wine.  
+
+I begin with an exploratory data analysis in order to inspect initial relations between the predictors and response variable. 
+
+## Exploratory data analysis
+```{r demo, echo=FALSE}
+white <- read.csv(file.path("data", "winequality-white.csv"), header=TRUE, sep=";")
+names(white) = c("fixed.acidity", "vol.acidity", "citric.acid", "res.sugar", "chlorides", "free.SO2", "total.SO2", "density", "pH", "sulfates", "alcohol", "quality")
+intquality.white <- white$quality
+white$quality <- as.factor(white$quality)
+N <- nrow(white)
+```
+
+### Univariate and bivariate analysis
+The following plots show the 11 predictors against `quality`, the variable of interest. The purpose of these plots is to examine the relationship between each predictor and wine quality, as well as the distribution of each individual predictor.
+
+```{r predictor bivariate, echo=FALSE}
+white.split <- white %>% pivot_longer(., -quality, names_to = "Variable", values_to = "Value")
+ggplot(white.split, aes(x=quality, y=Value)) +
+    geom_boxplot() +
+  facet_wrap(~ Variable, scales="free")+
+  ggtitle("Plots of predictors vs response variable `quality`")
+```
+
+The above plots reveal outliers in all of the measurements. However, `fixed.acidity`, `citric.acid`, `vol.acidity`, `pH` , `chlorides` and `sulfates` all show an especially high number of outliers. While there doesn't appear to be reason to question the validity of the data, these outliers are something to consider when creating the models. These plots do not show any incredibly strong relationships. However, there is a clear non-linear positive correlation between `quality` and `alcohol`. Furthermore, `quality` appears to be negatively correlated with `chlorides`, `total.sulfur.dioxide` and `density`. 
+Alongside the 11 predictors that came with the data, it might be valuable to explore new predictors created from existing ones. Four new predictors are generated, all relating to the ratio of related compounds. For ratios involving `pH`, it is converted back to a linear scale. The intuition behind this is that flavour is generally about balancing many components. Presumably, the ratios between various chemicals of interest might reflect whether some flavour components are "balanced" and thus correlate with the quality. The ratios are  
+
+| Name | Numerator | Denominator |  
+| ----------- | ----------- | ----------- |  
+| acidity.ratio | fixed.acididty | vol.acididty |  
+| free.sd.ratio |free.SO2 | total.SO2 |  
+| fixed.acidity.ratio | fixed.acidity | $10^{-\text{pH}}$ |  
+| vol.acidity.ratio | vol.acidity | $10^{-\text{pH}}$ |  
+
+
+```{r composite predictors, echo=FALSE}
+white.comp = white
+white.comp$acidity.ratio <- white$fixed.acidity/white$vol.acidity
+white.comp$free.sd.ratio <- white$free.SO2/white$total.SO2
+
+# pH is converted from log scale for correct ratio
+white.comp$fixed.acidity.ratio <- white$fixed.acidity/10^(-1*white$pH)
+white.comp$vol.acidity.ratio <- white$vol.acidity/10^(-1*white$pH)
+
+comp.split <- white.comp[,c(12:16)] %>% pivot_longer(., -quality, names_to = "Variable", values_to = "Value")
+ggplot(comp.split, aes(x=quality, y=Value)) +
+    geom_boxplot() +
+  facet_wrap(~ Variable, scales="free", nrow=1)+
+  ggtitle("Plots of composite features vs response variable `quality`")
+```
+While it certainly isn't a strong relationship, there does appear to be some positive correlation between `quality` and `acidity.ratio` and `free.sd.ratio`. Furthermore, it appears that `fixed.acidity.ratio` and `vol.acididty.ratio` may influence `quality` in some non-linear way however, the changes on the plot could just be random noise.
+
+The above plots show fairly clearly that it will be hard to find a direct relationship of any value between any individual predictor and quality. However, there does appear to be some underlying relationship between some predictors and quality.  
+
+### Variable Selection
+I can find out the significant factors using variable selection. Since there are only $2^{11}=2048$ possible models, it is still computationally feasible to test all possible selections. Here is the variable selection table:
+\tiny
+```{r variable_sel_exh, size='tiny'}
+options(width = 400)
+var_select = regsubsets(quality~., data = white,method = "exh",nvmax = 11)
+summary(var_select)$outmat
+
+```
+\normalsize
+
+This shows the variables that needed to be included based on AIC and BIC values. In other words, it also shows the order of variables I should remove if I want a reduced model. For example, for model with 8 variables, `citric.acid`, `chlorides` and `total.SO2` should be removed from the model.
+
+
+### Are there any interactions between the factors?
+To investigate possible interactions, I can first find the correlation matrix of the data and represent using a heat map:
+
+```{r corr, echo=FALSE}
+white_cor = white
+white_cor$quality = as.numeric(white_cor$quality)
+white_corr = cor(white_cor)
+corrplot(white_corr, method="color")
+```
+Without considering the actual correlation values, it is possible to see from the heat map that there is:
+
+- significant positive correlation between `res.sugar` and `density`
+- significant negative correlation between `alcohol` and `density`
+
+Logically, the correlation and direction make sense as I do expect if sugar content of a liquid increases, density should increase. On the other hand, as alcohol is less dense than water, I expect as alcohol content in wine increases, density of the wine decreases. These findings will prove useful when attempting to fit LDA and logistic regression models.
+\newpage
+
+## Analysis
+The following section describes multiple approaches towards classifying the data and their results.
+
+### Normalization
+Every predictor (including composite predictors) was normalized to a mean of 0 and a variance of 1 with the formula $x_i = \frac{x - \bar{x}}{SD(\bar{x})}$ for use in KNN, random forest and neural network classifiers. This normalization was used so as to eliminate the effect of predictor magnitude on model fit as different predictors had wildly different magnitudes. For example, `free.SO2` has a range in the hundreds while `chlorides` has a range of size less than 0.4. Without normalization, `free.SO2` would be hundreds of times more important  than `chlorides` in the KNN model for no real reason whatsoever. Standardization around mean and variance instead of standardization around min and max (i.e. each variable is scaled to a min of 0 and a max of 1) was chosen so that outliers do not disproportionately effect the standardized values. For example, a single outlier in `res.sugar` approximately doubles the maximum which would mean that every other value of `res.sugar` under the aforementioned standardization scheme would be double if that single value weren't present. 
+
+```{r normalize, echo=FALSE}
+normalize_col <- function(col) {
+  return((col - mean(col))/sd(col))
+}
+
+white.comp.norm <- white.comp
+
+for(i in 1:ncol(white.comp.norm)) {
+  if(i != 12) {
+    white.comp.norm[,i] <- normalize_col(white.comp.norm[,i])
+  }
+}
+
+white.norm <- white
+
+for(i in 1:ncol(white.norm)) {
+  if(i != 12) {
+    white.norm[,i] <- normalize_col(white.norm[,i])
+  }
+}
+```
+
+### LDA & Multinomial Logistic Regression
+```{r lda_multinom, include=FALSE}
+## LDA
+wine_lda = lda(quality~.-1, data = white)
+lda_train_err = mean(predict(wine_lda)$class != white$quality)
+lda_est = function(dataset) lda(quality~.-1, data = dataset)
+lda_pred = function(model, dataset) predict(model, newdata = dataset)
+lda_test_err = kfold_cv(white,lda_est,lda_pred, kfolds = 20, responsename = "quality",lda = TRUE)
+print(c(lda_train_err, lda_test_err))
+## Multinomial Logistic Regression
+mnorm = multinom(quality~., data = white)
+mnorm_train_err = mean(predict(mnorm, newdata = white[-12]) !=white$quality)
+# Calculate test error in multi log regression
+multin_est = function(dataset) multinom(quality~., data = dataset)
+multin_pred = function(model, dataset) predict(model, newdata = dataset)
+mnorm_test_err = kfold_cv(white, multin_est, multin_pred, kfolds = 20, responsename = "quality")
+print(c(mnorm_train_err, mnorm_test_err))
+```
+
+In addition to the models below, an attempt was made to conduct Linear Discriminant Analysis (LDA) and multinomial logistic regression on the data set. In the case of LDA, I find that the out-of-sample classification error is `r round(lda_test_err, 4)`.  This means that about `r round(lda_test_err, 4)*100` \% of classifications by LDA are wrong. Thus, LDA is not a good approach to classifying this data set. As for multinomial logistic regression, the training error obtained is 0.4596 and test error is 0.4653, which means the model will misclassify about 46.53% of the time. In other words, a multinomial logistic regression model is able to correctly predict wine quality only about 53.47% of the time, which is not a reliable prediction method.
+
+### Classification Tree
+Classification trees can easily be displayed and interpeted using a dendogram even when there are 11 features in our data set. Hence, I start by building a tree (classifier) that minimizes the Gini index.  
+
+Dendogram for Classification tree:
+
+```{r class-tree}
+white.for.tree <- white
+class.tree <- rpart(quality~., data= white.for.tree, method = "class", parms = list(split = "gini"))
+
+draw.tree(class.tree)
+```
+
+Looking at the dendogram above, I can see that our tree classifies all the observations with `quality` of 5, 6 and 7. This means that all of the observations with wine `quality` of 3, 4, 8, and 9 get classified incorrectly. According to the dendogram, for the wine to have the `quality` of 7, it is required to have `alcohol` amount of $12.55$ or more. Similarly, among wines with `vol.acidity` greater than $0.2375$, all wines with `alcohol` content less than $9.85$, wine will have a `quality` of 5. Hence, it is possible to make a hypothesis that the more alcohol content there is in wine, the better quality this wine is. However, it is important to state that classification trees have a high variance which implies that our conclusions could radically change with a small change in the input data. Thus, classification trees are inadequate as a classifier for this data.
+
+### Random Forest
+Random forests (RF) is a nonlinear classifier technique that reduces the variance compared to trees and bagged trees by growing each tree on a random subset of predictors, thereby decorrelating the trees. Instead of using cross-validation, RF models will be evaluated based on Out-of-Bag (OOB) error which consists of predicting each observation using only the trees for which it wasn't chosen. 
+
+```{r Rf-compvar, include=FALSE, eval=FALSE}
+numtrees = 5000
+rf_compvar <-
+  randomForest(quality ~ ., data = white.comp.norm, ntree = numtrees)
+rf_compvar
+varImpPlot(rf_compvar,
+           main = "Variable importance plot for RF model with 5000 trees and 15 features")
+
+oob.errors <- rf_compvar$err.rate[, 1]
+min.oob.error <- which(oob.errors == min(rf_compvar$err.rate[, 1]))
+plot(1:numtrees, oob.errors)
+abline(v = min.oob.error[1], col = "blue")
+text(min.oob.error[1], 0.36, toString(head(min.oob.error, 1)))
+
+```
+
+``` {r RF-less-compvar, include=FALSE, eval=FALSE}
+white.tree.cut <- white.comp.norm[ , !names(white.comp.norm) %in% c("res.sugar")]
+
+rf_cut <- randomForest(quality~., data = white.tree.cut, ntree=5000)
+varImpPlot(rf_cut, 
+           main = "Variable importance plot for RF model with 5000 trees and 14 features")
+rf_cut
+oob.errors <- rf_cut$err.rate[ , 1]
+min.oob.error <- which(oob.errors == min(rf_cut$err.rate[ , 1]))
+plot(1:numtrees, oob.errors)
+abline(v = min.oob.error[1], col="blue")
+text(min.oob.error[1], 0.36, toString(head(min.oob.error, 1)))
+
+```
+
+
+```{r RF-origwhite}
+numtrees = 5000
+rf_5000 <- randomForest(quality~., data=white.norm, ntree=numtrees)
+
+oob.errors <- rf_5000$err.rate[ , 1]
+
+label1 = paste("OOB error for all 5000 trees of: ", 
+              toString(round(rf_5000$err.rate[5000, 1]*100, 2)), "%")
+
+ggplot(data.frame(ntree=1:numtrees,OOB=oob.errors), aes(ntree,OOB)) + 
+  geom_point(color="black") +
+  ggtitle("OOB-errors for corresponding number of trees", label1)+
+  xlab("Number of trees") + 
+  ylab("OOB-error")
+```
+At first, multiple RF models with different features were fit. Incorporation of composite features did not result in a smaller OOB-error and an attempt to remove highly correlated features like `res.sugar`, `density` and `alcohol` does not seem reasonable since these features seem to be the most important when minimizing the Gini index.  
+
+Hence, an RF model with all original features and a large number (5000) of trees was chosen in order to build a plot above and to find out the number of trees that would lead to a minimized OOB-error.  For 5000 trees, the OOB-error is about $28.1\%$. The plot shows that the estimated prediction risk nearly plateaus after 500 trees. Error does appears to continue to decrease very slowly, thus, using all 5000 trees is justified. However, it should be noted that 5000 trees takes a while to compute and thus, a smaller number of trees would be a better size if computing time was a concern.
+
+Here is the Confusion matrix for RF model:
+```{r conf matrix}
+knitr::kable(rf_5000$confusion, digits=2) %>%
+  add_header_above(c(
+    "Truth" = 1,
+    "Prediction" = 7,
+    "Class.error" = 1
+  )) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+According to the confusion matrix, wines with `quality` of 3 and 9 are all predicted wrong, since their classification error is $100\%$. This may be due to the fact that there are not as many observations for groups 3, 9 as we have for wines with qualities of 5, 6, 7 and 8. Thus, I can expect a low prevalence of observations with these qualities in each bag and a split in the tree resulting in a prediction of a quality of 3 or 9 is unlikely.
+
+To find out what are the factors that influence the quality of wine the most, I explore the importance of each variable in the full 5000 trees random forest model.
+
+```{r var_import_data, include=FALSE}
+imp <- varImpPlot(rf_5000)
+```
+
+```{r var_plot, echo=FALSE}
+imp <- as.data.frame(imp)
+imp$varnames <- rownames(imp) # row names to column
+rownames(imp) <- NULL  
+
+ggplot(imp, aes(x=reorder(varnames, MeanDecreaseGini), y=MeanDecreaseGini)) + 
+  geom_point() +
+  geom_segment(aes(x=varnames,xend=varnames,y=0,yend=MeanDecreaseGini)) +
+  scale_color_discrete(name="Variable Group") +
+  ylab("Mean Decrease Gini") +
+  xlab("Variable Name") +
+  ggtitle("Variable Importance plot for the RF model with 5000 trees")+
+  coord_flip()
+```
+The results from the Variable Importance plot indicate that across all of the trees considered in the random forest, three most important predictors for minimizing the Gini index are `alcohol`, `density` and `vol.acidity`.
+
+
+### K-Nearest-Neighbor
+The following chart shows the LOO-CV error of a K-Nearest Neighbors model on all 15 predictors (including the composite ones) which have been normalized. Of note is that `k=1` is by far and away the strongest `k` value. This makes sense as I expect to experience the "curse of dimensionality" in this case and the 2nd and 3rd nearest neighbors for each one may be very far away from the test value. It should be expected that `k=1` will be superior for high dimensional models.
+
+```{r knn start, echo=FALSE}
+knn_fit_cols <- function(train, cl, kmax=1) {
+  # code from lec 17
+  err <- double(kmax)
+  for (ii in 1:kmax) {
+    pk <- knn.cv(train, cl, k = ii) # does leave one out CV
+    err[ii] <- sum(pk != cl)/N
+  }
+  
+  return(err)
+}
+
+train <- white.comp.norm[, -12]
+full_err <- data.frame(err=knn_fit_cols(train, white.comp.norm$quality, kmax=20))
+full_err$k <- c(1:nrow(full_err))
+
+full_err %>% ggplot(aes(x=k, y=err, group=1)) +
+  geom_line() + geom_point() +
+  ggtitle("CV error for k of 1-20 on wine data") + ylab("CV error")
+
+```
+
+However, it is unlikely that the optimal KNN model is that with all the predictors, especially when one considers the issues with KNN in high dimensional predictor space. Searching all $2^{15}$ possible models is computationally unfeasible. Thus, backwards and forwards greedy selection are used to generate a new model.
+
+```{r knn bckwd feature selection, echo=FALSE}
+npreds <- 15
+bckwd.err <- double(npreds)
+bckwd.k <- integer(npreds)
+bckwd.err[npreds] <- min(full_err$err) # start with what we calculated last time
+bckwd.k[npreds] <- which.min(full_err$err)
+keep_cols <- 1:npreds
+bckwd.best_cols <- keep_cols
+
+for(i in (npreds - 1):1) {
+  best_round_err <- 1
+  
+  # for each round, drop each column still in the round
+  for (j in  1:length(keep_cols)) {
+    test_cols <- keep_cols[-j]
+    trial.df <- subset(train, select=unlist(test_cols))
+    k_errs <- knn_fit_cols(trial.df, white.comp.norm$quality, kmax=1)
+    min_err <- min(k_errs)
+    if (min_err < best_round_err) {
+      best_round_err <- min_err
+      best_k <- which.min(k_errs)
+      drop_col <- j
+    }
+  }
+  
+  bckwd.err[i] <- best_round_err
+  bckwd.k[i] <- best_k
+  
+  if(best_round_err < 1) {
+    # remove worst predictor from model
+    keep_cols <- keep_cols[-drop_col]
+    if (best_round_err == min(bckwd.err[i:15])){
+      bckwd.best_cols <- keep_cols
+    }
+  }
+  else {
+    break
+  }
+}
+```
+
+```{r knn fwd feature selection, echo=FALSE}
+npreds <- 15
+fwd.err <- double(npreds)
+fwd.k <- integer(npreds)
+drop_cols <- 1:npreds
+fwd.keep_cols <- list()
+fwd.best_cols <- fwd.keep_cols
+
+for(i in 1:npreds) {
+  best_round_err <- 1
+  
+  # for each round, drop each column still in the round
+  for (j in  1:length(drop_cols)) {
+    test_cols <- keep_cols
+    test_cols[i] <- drop_cols[j]
+    trial.df <- subset(train, select=unlist(test_cols))
+    k_errs <- knn_fit_cols(trial.df, white.comp.norm$quality, kmax=1)
+    min_err <- min(k_errs)
+    if (min_err < best_round_err) {
+      best_round_err <- min_err
+      best_k <- which.min(k_errs)
+      keep_col <- j
+    }
+  }
+  
+  fwd.err[i] <- best_round_err
+  fwd.k[i] <- best_k
+  
+  if(best_round_err < 1) {
+    # add best predictor to model
+    keep_cols[i] <- drop_cols[keep_col]
+    drop_cols <- drop_cols[-keep_col]
+    if (best_round_err == min(fwd.err[1:i])){
+      fwd.best_cols <- keep_cols
+    }
+  }
+  else {
+    break
+  }
+}
+```
+
+
+```{r knn feature selection plot, echo=FALSE}
+errs <- data.frame(n=c(1:15), bckwderr=bckwd.err, fwderr=fwd.err)
+colnames(errs) <- c("n", "Backwards selection", "Forwards selection")
+
+errs.split <- errs %>% pivot_longer(., -n, names_to = "Type", values_to = "Error")
+
+errs.split %>%
+  ggplot(aes(x=n, y=Error, group=Type, color=Type)) +
+  geom_line() + geom_point() +
+  ggtitle("KNN predictor selection") +
+  xlab("Number of predictors")
+
+
+bckwd.best_train <- subset(train, select=unlist(bckwd.best_cols))
+bckwd.best_cols.names <- colnames(bckwd.best_train)
+bckwd.best_num_preds <- length(bckwd.best_cols)
+bckwd.best_k <- bckwd.k[bckwd.best_num_preds]
+bckwd.best_cv <- min(bckwd.err)
+
+fwd.best_train <- subset(train, select=unlist(fwd.best_cols))
+fwd.best_cols.names <- colnames(fwd.best_train)
+fwd.best_num_preds <- length(fwd.best_cols)
+fwd.best_k <- fwd.k[fwd.best_num_preds]
+fwd.best_cv <- min(fwd.err)
+
+preds <- knn.cv(bckwd.best_train, white.comp.norm$quality, k=1)
+
+summary <- data.frame(Method=c("Backwards selection", "Forwards selection"),
+                      CV=c(bckwd.best_cv, fwd.best_cv),
+                      k=c(bckwd.best_k, fwd.best_k)
+                      )
+```
+
+The above graph shows the CV error by number of predictors for backwards and forwards selection on a 1-nearest-neighbor model. Higher `k` values were tested but were too computationally intensive and less error. With a test of `kmax=25`, only the models with 1-3 predictors benefited from more than 1 nearest neighbor and their CV error was still far too high. It appears that backwards selection produced a model with lower prediction risk. Here are the CV-errors for each selection method:
+```{r cv-err-table}
+knitr::kable(summary, digits=3) %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+Here is the Confusion matrix for the best KNN:
+```{r knn conf matrix, echo=FALSE}
+cm <- table(white.comp.norm$quality, preds, dnn=c("truth", "predicted"))
+knitr::kable(cm, digits=2) %>% 
+  add_header_above(c("Truth" = 1, "Prediction" = 7)) %>%  
+  kable_styling(latex_options = "HOLD_position")
+```
+The best model by prediction risk from cross validation is the model from both backwards and forwards selection with `k=1` and 12 predictors, all predictors except for `chlorides`, `density`, `acidity.ratio` and `free.sd.ratio`. The CV score for this model was 32.18\% which corresponds with an estimated classification accuracy of 67.82\% which is rather inaccurate. The confusion matrix, shown above, indicates that not a single wine of true quality 3 or 9 was predicted accurately. This makes sense as the data set is heavily unbalanced and if no two of the few wines in those classes are close together, we won't see a single accurate prediction. This phenomenon illustrates the limitations of using KNN on unbalanced data.
+
+### Neural Network
+To constrain the scope of the project to a reasonable size and to reduce computation time, only single hidden layer neural networks were explored. To estimate prediction risk, 5-fold CV was chosen. The value of 5 was chosen as a balance between the larger variance of using less folds and the larger computational requirements of using more folds. After varying the hyperparameters, a model with a hidden layer of size 100 was chosen for the balance between computational intensity and prediction risk. However, this model under performed, with an accuracy of only 59.7\%. Thus, it appears that single layer neural networks are unsuitable for this challenge.
+
+```{r nnet_cv, echo=FALSE, include=FALSE}
+# calculate kfold cv for classification on single hidden layer nnets
+# code adapted from lecture 21 slides
+nnet.cv <- function(form, responsename, data, kfolds=5, size=1, decay=0, maxit=100, maxNWts=10000, cm=FALSE) {
+  n <- nrow(data)
+  fold.labels <- sample(rep(1:kfolds, length.out = n))
+  err <- double(kfolds)
+  preds.total <- c()
+  resp.total <- c()
+  
+  for (i in 1:kfolds) {
+    test.rows <- fold.labels == i
+    train <- data[!test.rows, ]
+    test <- data[test.rows, ]
+    mdl <- nnet(quality ~ ., data = train, size = size, decay = decay, maxit = maxit, MaxNWts = maxNWts, type="class")
+    test_responses <- test[, responsename]
+    preds <- predict(mdl, test, type="class")
+    preds <- factor(preds, levels=levels(test_responses))
+    err[i] <- sum(preds != test_responses)/length(test_responses)
+    
+    preds.total <- append(preds.total, preds)
+    resp.total <- append(resp.total, test_responses)
+  }
+  
+  cm <- table(resp.total, preds.total, dnn=c("truth", "predicted"))
+  retlist <- list("mean.err" = mean(err), "errs"=err, "conf.matrix"=cm)
+  
+  return(retlist)
+}
+```
+
+```{r nnet, echo=FALSE, include=FALSE, eval=FALSE}
+# not evaluated as it takes so long but this is what was done for finding nnet size
+nn.err <- double(10)
+for (i in 1:10){
+  ret <- nnet.cv(quality ~ ., "quality", data=white.comp.norm, size=10*i, maxit=200)
+  nn.err[i] <- ret$mean.err
+}
+which.min(nn.err)
+```
+Here is the Confusion matrix for Neural Network:
+
+```{r nnet mdl, echo=FALSE, include=FALSE}
+ret <- nnet.cv(quality ~ ., "quality", data=white.comp.norm, size=100, maxit=200)
+```
+
+```{r nnet cm, echo=FALSE}
+knitr::kable(ret$conf.matrix, digits=2) %>% 
+  add_header_above(c("Truth" = 1, "Prediction" = 7)) %>%  
+  kable_styling(latex_options = "HOLD_position")
+```
+The confusion matrix of the neural network, shown above, displays a similar phenomenon as seen in the random forest model and KNN. The prediction accuracy of wines of quality 3 and 9 is 0. The small number of observations with these qualities used when training the model means that unless the test observation(s) happen to be extremely close to the training observations for a given rare quality, the model won't be able to predict that quality with any accuracy.
+
+## Conclusion
+
+### Final model
+Out of all models explored, random forest was the best, measured by OOB error (and CV error for the others) with a prediction risk of around 28.1%, corresponding with an accuracy of around 71.9%. There are likely many reasons that the random forest excels in this case including its ability to handle correlated predictors, resulting in a lower variance while maintaining most of the low bias characteristics of trees. Further attempts to create a better model with this data could benefit from an exploration of an error function based on category distance, neural nets with more layers and ensemble models.
+
+### Are all the 4898 data points useful? (ie. missing or logically unsound)
+All observations appeared to be sound. However, there were some outliers that had to be taken into account when considering how to standardize data. Furthermore, the data was rather imbalanced, leading to low classification accuracy for wines of quality 3 (extremely low) or 9 (extremely high) in KNN, RF and NN. It appears that this data was only sufficient for predicting wines of average quality (4-8).
+
+### Which are the factors that influence the quality of wine? (all or only some)
+Backwards predictor selection excluded `chlorides`, `density`, `acidity.ratio` and `free.sd.ratio` from the best KNN model. However, all predictors appear to have significant importance based on the random forest variable importance plot. Thus, it is possible that the effect of the excluded predictors (the last two being composite predictors) is negligible but we cannot make any conclusions. It is likely that most, if not all, of the predictors included in the KNN model have some affect on the quality of the wine as they all increased the cross validation score.
+
+### Are there any interactions between the factors?
+Yes. As discussed in the data analysis, there is a strong positive correlation between `res.sugar` and `density` and a strong negative correlation between `alcohol` and `density` as well as some other weaker relationships. As random forest decorrelates predictors by only using a subset of them for each tree, it is likely that it was so successful in part due to its ability to deal with the interactions between factors.
+
+### Are there any confounding factors? (Factors that are not considered but may influence wine quality significantly)
+Some of the generated features were marginally useful when calculating KNN. However, adding them to the random forest, the highest performing model, did not decrease OOB error. Thus, I did not not discover any other factors of note. However, an interesting extension of this project would be to attempt PCA and kPCA on this dataset to try and generate principal components of some meaning.
+
+## References
+
