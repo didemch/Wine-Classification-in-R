@@ -1,5 +1,5 @@
 # wine-classif
-After taking a Wine Studies course, I became interested in Winemaking. Winemaking is a complex craft as wine flavor and quality depend on many different factors such as acids, alcohol compounds, pH of the grape juice and others. I am interested in finding out whether it is possible to predict the quality of the wine because it would make it easier to find a good wine for laypeople.  
+After taking a Wine Studies course, I became interested in Winemaking. Winemaking is a complex craft as wine flavor and quality depend on many different factors such as acids, alcohol compounds, pH of the grape juice and others. I am interested in $$finding out whether it is possible to predict the quality of the wine$$ because it would make it easier to find a good wine for laypeople.  
 
 Each wine has many different flavors; after drinking the same wine, some people may think it was fruity and some people may find it too sour. Hence, each person will judge the wine based on their own perception. But I thought it would be fun and interesting to find out whether we could "predict" the wine quality in advance based on its chemical features. Then, there might be a universal "grading" scheme for wines based on facts (values) rather than on people's wine tasting skills and preferences.  
 
